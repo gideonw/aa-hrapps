@@ -109,11 +109,16 @@ class HRApps(commands.Cog):
 
         redis_client = get_redis_client()
         rkwargs = redis_client.connection_pool.connection_kwargs
-        rkwargs["decode_responses"] = True
-        rkwargs.pop("parser_class", None)
-        rkwargs.pop("password", None)
 
-        self.redis_client = aioredis.Redis(**rkwargs)
+        askwargs = {
+            "decode_responses": True,
+            'host': rkwargs.get('host', 'localhost'),
+            'port': rkwargs.get('port', 6379),
+            'db': rkwargs.get('db', 0),
+            'password': rkwargs.get('password', None),
+        }
+
+        self.redis_client = aioredis.Redis(**askwargs)
         self.pubsub = self.redis_client.pubsub()
         self.listener_task = self.bot.loop.create_task(self.listen_to_mq())
         logger.debug("Initialized HRApp cog.")
