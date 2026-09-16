@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.3 - 2026-09-16
+### Fixes
+* Fixed issue where some versions of redis caused the discord bot cog to fail to load.
+
 ## 1.0.2 - 2026-08-21
 ### Changes
 * Added an Admin Attachments section to the admin application view page.
