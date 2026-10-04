@@ -463,6 +463,8 @@ def update_discord_welcome_settings(request):
     welcomeChannel = data.get("channel")
     welcomeMessage = data.get("message")
     welcomeIgnoredStates = [int(x) for x in data.getlist("ignored_states")]
+    # An unchecked HTML checkbox posts no key at all, so absence means False.
+    welcomeIncludeButton = data.get("include_recruit_button") == "on"
 
     if welcomeChannel == "":
         welcomeChannel = None
@@ -477,6 +479,7 @@ def update_discord_welcome_settings(request):
         discord_settings.enable_welcome_messages = welcomeEnabled
         discord_settings.welcome_channel = welcomeChannel
         discord_settings.welcome_message = welcomeMessage
+        discord_settings.welcome_include_recruit_button = welcomeIncludeButton
         discord_settings.ignored_states.set(welcomeIgnoredStates)
         discord_settings.save()
     except Exception as e:
