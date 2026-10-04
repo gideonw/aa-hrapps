@@ -235,3 +235,87 @@ class EnsureChannelTests(SimpleTestCase):
         self.assertIs(result, channel)
         category.create_text_channel.assert_awaited_once()
         channel.send.assert_awaited_once()
+
+
+def _archive_guild():
+    guild, _, _ = _guild_and_category()
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    channel.edit = AsyncMock()
+    channel.set_permissions = AsyncMock()
+
+    archive = MagicMock(spec=discord.CategoryChannel)
+    member = _member()
+
+    # First lookup is the channel being archived; second is the archive category.
+    guild.get_channel.side_effect = [channel, archive]
+    guild.get_member.return_value = member
+    return guild, channel, archive, member
+
+
+class ArchiveChannelTests(SimpleTestCase):
+    async def test_non_closed_application_archives_nothing(self):
+        """Review Focus 3. The status-changed message also fires for
+        pending to under_review."""
+        guild = MagicMock()
+        with patch.object(rc, "closed_application_discord_id", return_value=None), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        marked.assert_not_called()
+
+    async def test_applicant_without_a_channel_is_a_noop(self):
+        guild = MagicMock()
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=None), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        marked.assert_not_called()
+
+    async def test_archive_moves_channel_without_syncing_permissions(self):
+        """Review Focus 5. Syncing would replace the channel's overwrites with
+        the archive category's and could re-expose the closed conversation."""
+        guild, channel, archive, _ = _archive_guild()
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived"):
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        channel.edit.assert_awaited_once()
+        self.assertIs(channel.edit.call_args.kwargs["sync_permissions"], False)
+        self.assertIs(channel.edit.call_args.kwargs["category"], archive)
+
+    async def test_applicant_overwrite_is_removed(self):
+        guild, channel, _, member = _archive_guild()
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived"):
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        channel.set_permissions.assert_awaited_once_with(member, overwrite=None)
+
+    async def test_departed_member_still_gets_the_channel_moved(self):
+        guild, channel, _, _ = _archive_guild()
+        guild.get_member.return_value = None
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived"):
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        channel.set_permissions.assert_not_awaited()
+        channel.edit.assert_awaited_once()
+
+    async def test_row_is_retired_when_the_channel_is_already_gone(self):
+        guild = MagicMock()
+        guild.get_channel.return_value = None
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        marked.assert_called_once_with(222)
+
+    async def test_missing_archive_category_leaves_the_channel_in_place(self):
+        guild, channel, _, _ = _archive_guild()
+        guild.get_channel.side_effect = [channel, MagicMock()]  # not a category
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        channel.edit.assert_not_awaited()
+        marked.assert_not_called()

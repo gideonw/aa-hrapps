@@ -167,3 +167,52 @@ async def _create_recruitment_channel(guild, member, settings):
         f"{member.mention} has indicated they are interested in joining."
     )
     return channel
+
+
+async def archive_recruitment_channel(guild, app_pk, settings):
+    """Drop the applicant's access and move their channel to the archive.
+
+    Called on the "application status changed" message, which also fires for
+    transitions that are not closures; closed_application_discord_id returns
+    None for those, so this is a no-op unless the application really closed.
+    """
+    discord_user_id = await sync_to_async(closed_application_discord_id)(app_pk)
+    if discord_user_id is None:
+        return
+
+    channel_id = await sync_to_async(get_open_channel_id)(discord_user_id)
+    if channel_id is None:
+        # They never ran /recruit_me, or it was archived already.
+        return
+
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        # Deleted by hand. Nothing to move, but retire the row so the member is
+        # not blocked if they ever apply again.
+        await sync_to_async(mark_archived)(channel_id)
+        return
+
+    archive = guild.get_channel(settings.recruitment_archive_category)
+    if not isinstance(archive, discord.CategoryChannel):
+        logger.error(
+            f"recruitment_archive_category {settings.recruitment_archive_category} is "
+            f"missing or is not a category; leaving channel {channel_id} in place."
+        )
+        return
+
+    member = guild.get_member(discord_user_id)
+    try:
+        if member is not None:
+            await channel.set_permissions(member, overwrite=None)
+        # sync_permissions=False is load-bearing: syncing would replace this
+        # channel's overwrites with the archive category's, undoing the line
+        # above and potentially re-exposing the conversation just closed.
+        await channel.edit(category=archive, sync_permissions=False)
+    except discord.Forbidden:
+        logger.error(
+            f"Missing permissions to archive channel {channel_id}; leaving it in place."
+        )
+        return
+
+    await sync_to_async(mark_archived)(channel_id)
+    await channel.send("This application is closed. This channel has been archived.")
