@@ -55,8 +55,9 @@ class RecruitmentSettingsViewTests(TestCase):
         response = self._post(
             mode=RecruitmentMode.CHANNELS, role="1", rrole="2", archive_category="3"
         )
-        self.assertTrue(
+        self.assertIs(
             any("recruitment category" in m for m in self._messages(response)),
+            True,
             self._messages(response),
         )
 
@@ -64,22 +65,25 @@ class RecruitmentSettingsViewTests(TestCase):
         response = self._post(
             mode=RecruitmentMode.CHANNELS, category="1", archive_category="2", rrole="3"
         )
-        self.assertTrue(
+        self.assertIs(
             any("recruiter role" in m for m in self._messages(response)),
+            True,
             self._messages(response),
         )
 
     def test_threads_mode_without_a_thread_channel_is_rejected(self):
         response = self._post(mode=RecruitmentMode.THREADS, role="1")
-        self.assertTrue(
+        self.assertIs(
             any("thread channel" in m for m in self._messages(response)),
+            True,
             self._messages(response),
         )
 
     def test_unknown_mode_is_rejected(self):
         response = self._post(mode="nonsense")
-        self.assertTrue(
+        self.assertIs(
             any("Unknown recruitment mode" in m for m in self._messages(response)),
+            True,
             self._messages(response),
         )
 
