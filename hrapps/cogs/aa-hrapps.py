@@ -11,7 +11,11 @@ from allianceauth.services.hooks import get_extension_logger
 from aadiscordbot.app_settings import get_all_servers, get_site_url
 from aadiscordbot.cogs.utils.exceptions import NotAuthenticated
 from discord.ext import commands
-from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment
+from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment, RecruitmentMode
+from hrapps.recruitment_channels import (
+    archive_recruitment_channel,
+    ensure_recruitment_channel,
+)
 from allianceauth.eveonline.evelinks import eveimageserver
 
 logger = get_extension_logger(__name__)
@@ -44,6 +48,41 @@ async def create_recruitment_thread(member, guild, channel_id, recruiter_role_id
     await thread.send(f"*ATTN: {recruiter_role.mention}*\n\n{member.mention} has indicated they are interested in joining.")
 
 
+async def start_recruitment(guild, member, settings):
+    """Open or re-point the member's recruitment space for the configured mode.
+
+    Returns True when the member has somewhere to talk, False when channel
+    creation failed and the caller should say so rather than imply success.
+    """
+    if settings.recruitment_mode == RecruitmentMode.CHANNELS:
+        try:
+            channel = await ensure_recruitment_channel(guild, member, settings)
+        except Exception:
+            logger.exception(
+                f"Failed to open a recruitment channel for {member.name}."
+            )
+            return False
+        return channel is not None
+
+    if settings.recruitment_mode == RecruitmentMode.THREADS:
+        existing_thread = await check_active_threads(
+            member, guild, settings.recruitment_thread_channel
+        )
+        if existing_thread:
+            channel = guild.get_channel(existing_thread)
+            await channel.send(
+                f"{member.mention} here is your existing recruitment thread!"
+            )
+            return True
+        await create_recruitment_thread(
+            member, guild, settings.recruitment_thread_channel, settings.recruiter_role
+        )
+        return True
+
+    logger.debug("Recruitment is disabled; not opening a channel or thread.")
+    return False
+
+
 class RecruitButtonView(discord.ui.View):
     def __init__(self, bot, member=None):
         super().__init__(timeout=None)
@@ -70,17 +109,7 @@ class RecruitButtonView(discord.ui.View):
         settings = HRAppDiscordSettings.get_solo()
 
         await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
-        existing_thread = await check_active_threads(self.member, interaction.guild, settings.recruitment_thread_channel)
-        if existing_thread:
-            channel = interaction.guild.get_channel(existing_thread)
-            await channel.send(f"{self.member.mention} here is your existing recruitment thread!")
-        else:
-            await create_recruitment_thread(
-                self.member,
-                interaction.guild,
-                settings.recruitment_thread_channel,
-                settings.recruiter_role
-            )
+        await start_recruitment(interaction.guild, self.member, settings)
 
         await interaction.response.edit_message(view=None)
 
@@ -152,7 +181,15 @@ class HRApps(commands.Cog):
                         await self.send_claim_notification(data.get("app_pk"), data.get("recruiter", True))
                     if action == "application status changed":
                         logger.debug("HRApp application status changed, sending notification.")
-                        await self.send_status_notification(data.get("app_pk"), data.get("old"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_status_notification(
+                                data.get("app_pk"), data.get("old")
+                            )
+                        if self.settings.recruitment_mode == RecruitmentMode.CHANNELS:
+                            for guild in self.bot.guilds:
+                                await archive_recruitment_channel(
+                                    guild, data.get("app_pk"), self.settings
+                                )
         except asyncio.CancelledError:
             logger.debug("Cancelled listening for HRApp settings updates.")
         except Exception as e:
@@ -289,9 +326,13 @@ class HRApps(commands.Cog):
 
         # Welcome the user
         logger.debug(f"Welcoming user {member.name}")
-        logger.debug(f"Use Recruitment Threads on? {self.settings.use_recruitment_threads}")
+        logger.debug(f"Recruitment mode: {self.settings.recruitment_mode}")
         welcome_channel = self.bot.get_channel(self.settings.welcome_channel)
-        recruit_view = RecruitButtonView(self.bot, member) if self.settings.use_recruitment_threads else None
+        recruit_view = (
+            RecruitButtonView(self.bot, member)
+            if self.settings.recruitment_mode != RecruitmentMode.OFF
+            else None
+        )
         await welcome_channel.send(
             self.settings.welcome_message.format_map(
                 defaultdict(
@@ -305,7 +346,8 @@ class HRApps(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not self.settings.use_recruitment_threads:
+        # Only threads announce themselves with a system message to delete.
+        if self.settings.recruitment_mode != RecruitmentMode.THREADS:
             return
 
         logger.debug(f"Message type: {message.type}")
@@ -329,21 +371,14 @@ class HRApps(commands.Cog):
             pass
 
         await add_recruit_role(ctx.author, ctx.guild, self.settings.recruit_role)
-        existing_thread = await check_active_threads(ctx.author, ctx.guild, self.settings.recruitment_thread_channel)
-        if existing_thread:
-            print(existing_thread)
-            channel = await self.bot.fetch_channel(existing_thread)
-            print(channel)
-            await channel.send(f"{ctx.author.mention} here is your existing recruitment thread!")
-            return await ctx.respond("You have already started the recruitment process.\n"
-                                     "Please check for your recruitment thread.", ephemeral=True)
-        await create_recruitment_thread(
-            ctx.author,
-            ctx.guild,
-            self.settings.recruitment_thread_channel,
-            self.settings.recruiter_role
-        )
-        return await ctx.respond("Your recruitment thread has been created.", ephemeral=True)
+        started = await start_recruitment(ctx.guild, ctx.author, self.settings)
+        if not started:
+            return await ctx.respond(
+                "Your recruitment channel could not be created. "
+                "Please contact a recruiter.",
+                ephemeral=True,
+            )
+        return await ctx.respond("Your recruitment channel is ready.", ephemeral=True)
 
 
 def setup(bot):
