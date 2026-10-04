@@ -10,6 +10,7 @@ from aadiscordbot.utils.auth import get_auth_user
 from allianceauth.services.hooks import get_extension_logger
 from aadiscordbot.app_settings import get_all_servers, get_site_url
 from aadiscordbot.cogs.utils.exceptions import NotAuthenticated
+from asgiref.sync import sync_to_async
 from discord.ext import commands
 from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment, RecruitmentMode
 from hrapps.recruitment_channels import (
@@ -106,7 +107,7 @@ class RecruitButtonView(discord.ui.View):
         if interaction.user != self.member:
             await interaction.response.send_message("You can not make this decision for others.", ephemeral=True)
             return
-        settings = HRAppDiscordSettings.get_solo()
+        settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
 
         await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
         await start_recruitment(interaction.guild, self.member, settings)
@@ -198,6 +199,13 @@ class HRApps(commands.Cog):
 
     async def send_new_app_notification(self, app_pk):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
+        embed = await sync_to_async(self._new_app_embed)(app_pk)
+        await channel.send(embed=embed)
+
+    def _new_app_embed(self, app_pk):
+        """Build the embed. Sync on purpose: every attribute walked below
+        (user.profile.main_character, form.corporation) is a lazy FK that
+        queries, so the whole build has to run off the event loop."""
         application = FormResponse.objects.get(pk=app_pk)
         embed = discord.Embed(
             title="New Application Submitted",
@@ -212,10 +220,17 @@ class HRApps(commands.Cog):
         embed.add_field(name=" ", value="⠀")
         embed.add_field(name="App Link", value=f"[Click Here]({settings.SITE_URL}/hradmin/resp/{app_pk})", inline=False)
 
-        await channel.send(embed=embed)
 
+        return embed
     async def send_new_comment_notification(self, comment_pk):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
+        embed = await sync_to_async(self._new_comment_embed)(comment_pk)
+        await channel.send(embed=embed)
+
+    def _new_comment_embed(self, comment_pk):
+        """Build the embed. Sync on purpose: every attribute walked below
+        (user.profile.main_character, form.corporation) is a lazy FK that
+        queries, so the whole build has to run off the event loop."""
         comment = ResponseComment.objects.get(pk=comment_pk)
         application = comment.response
         embed = discord.Embed(
@@ -233,10 +248,17 @@ class HRApps(commands.Cog):
 
         embed.add_field(name="App Link", value=f"[Click Here]({settings.SITE_URL}/hradmin/resp/{application.pk})", inline=False)
 
-        await channel.send(embed=embed)
 
+        return embed
     async def send_claim_notification(self, app_pk, recruiter=True):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
+        embed = await sync_to_async(self._claim_embed)(app_pk, recruiter)
+        await channel.send(embed=embed)
+
+    def _claim_embed(self, app_pk, recruiter=True):
+        """Build the embed. Sync on purpose: every attribute walked below
+        (user.profile.main_character, form.corporation) is a lazy FK that
+        queries, so the whole build has to run off the event loop."""
         application = FormResponse.objects.get(pk=app_pk)
         claimer = application.recruiter if recruiter else application.reviewer
         title = ""
@@ -264,10 +286,17 @@ class HRApps(commands.Cog):
         embed.add_field(name="App Link", value=f"[Click Here]({settings.SITE_URL}/hradmin/resp/{application.pk})",
                         inline=False)
 
-        await channel.send(embed=embed)
 
+        return embed
     async def send_status_notification(self, app_pk, old_status):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
+        embed = await sync_to_async(self._status_embed)(app_pk, old_status)
+        await channel.send(embed=embed)
+
+    def _status_embed(self, app_pk, old_status):
+        """Build the embed. Sync on purpose: every attribute walked below
+        (user.profile.main_character, form.corporation) is a lazy FK that
+        queries, so the whole build has to run off the event loop."""
         application = FormResponse.objects.get(pk=app_pk)
         title = "Application Status Changed"
         description = (f"{application.user.profile.main_character.character_name}'s application to join "
@@ -302,18 +331,28 @@ class HRApps(commands.Cog):
 
         embed.add_field(name="App Link", value=f"[Click Here]({settings.SITE_URL}/hradmin/resp/{application.pk})",
                         inline=False)
-        await channel.send(embed=embed)
 
+        return embed
     async def update_settings(self):
-        self.settings = HRAppDiscordSettings.get_solo()
+        self.settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+
+    def _is_ignored_state(self, discord_user, guild):
+        """Resolve the auth user and test their state against ignored_states.
+
+        Sync on purpose, and called through sync_to_async: get_auth_user queries,
+        and `user.profile.state` plus `ignored_states.all()` are two more queries.
+        Raises NotAuthenticated when the Discord user has no linked auth account,
+        which both callers already handle.
+        """
+        user = get_auth_user(discord_user, guild)
+        return user.profile.state in self.settings.ignored_states.all()
 
     @commands.Cog.listener()
     async def on_member_join(self, member):
         logger.debug(f"Member joined the server.")
         # Check if the user is part of an ignored state, if so we can return, no need to welcome.
         try:
-            user = get_auth_user(member._user, member.guild)
-            if user.profile.state in self.settings.ignored_states.all():
+            if await sync_to_async(self._is_ignored_state)(member._user, member.guild):
                 logger.debug(f"User is in ignored state, no need to welcome.")
                 return
         except NotAuthenticated:
@@ -364,8 +403,7 @@ class HRApps(commands.Cog):
     @commands.slash_command(name="recruit_me", description="Begin the recruitment process.", guild_ids=get_all_servers())
     async def recruit_me(self, ctx):
         try:
-            user = get_auth_user(ctx.author, ctx.guild)
-            if user.profile.state in self.settings.ignored_states.all():
+            if await sync_to_async(self._is_ignored_state)(ctx.author, ctx.guild):
                 return await ctx.respond("You are not eligible for recruitment.", ephemeral=True)
         except NotAuthenticated:
             pass
