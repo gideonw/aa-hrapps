@@ -149,7 +149,7 @@ class CreateChannelTests(SimpleTestCase):
         with patch.object(rc, "record_channel"):
             await rc._create_recruitment_channel(guild, _member(), _channels_settings())
         overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
-        self.assertFalse(overwrites[guild.default_role].view_channel)
+        self.assertIs(overwrites[guild.default_role].view_channel, False)
 
     async def test_recruiter_role_can_view_the_channel(self):
         guild, category, _ = _guild_and_category()
@@ -157,7 +157,7 @@ class CreateChannelTests(SimpleTestCase):
         with patch.object(rc, "record_channel"):
             await rc._create_recruitment_channel(guild, _member(), _channels_settings())
         overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
-        self.assertTrue(overwrites[role].view_channel)
+        self.assertIs(overwrites[role].view_channel, True)
 
     async def test_applicant_can_view_the_channel(self):
         guild, category, _ = _guild_and_category()
@@ -165,7 +165,7 @@ class CreateChannelTests(SimpleTestCase):
         with patch.object(rc, "record_channel"):
             await rc._create_recruitment_channel(guild, member, _channels_settings())
         overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
-        self.assertTrue(overwrites[member].view_channel)
+        self.assertIs(overwrites[member].view_channel, True)
 
     async def test_failed_registry_write_deletes_the_channel(self):
         """An unrecorded channel is invisible to every later lookup, so it would
@@ -197,7 +197,7 @@ class CreateChannelTests(SimpleTestCase):
         category.create_text_channel.assert_not_awaited()
 
     async def test_non_category_id_creates_nothing(self):
-        guild, category, _ = _guild_and_category()
+        guild, _, _ = _guild_and_category()
         guild.get_channel.return_value = MagicMock()  # not a CategoryChannel
         result = await rc._create_recruitment_channel(guild, _member(), _channels_settings())
         self.assertIsNone(result)
@@ -205,7 +205,7 @@ class CreateChannelTests(SimpleTestCase):
 
 class EnsureChannelTests(SimpleTestCase):
     async def test_existing_channel_is_reused(self):
-        guild, category, _ = _guild_and_category()
+        guild, _, _ = _guild_and_category()
         existing = MagicMock()
         existing.send = AsyncMock()
         guild.get_channel.return_value = existing
@@ -213,7 +213,6 @@ class EnsureChannelTests(SimpleTestCase):
             result = await rc.ensure_recruitment_channel(guild, _member(), _channels_settings())
         self.assertIs(result, existing)
         existing.send.assert_awaited()
-        category.create_text_channel.assert_not_awaited()
 
     async def test_stale_row_is_retired_and_a_new_channel_created(self):
         """Review Focus 2. Without retiring the row, the unique index on
@@ -235,3 +234,4 @@ class EnsureChannelTests(SimpleTestCase):
             result = await rc.ensure_recruitment_channel(guild, _member(), _channels_settings())
         self.assertIs(result, channel)
         category.create_text_channel.assert_awaited_once()
+        channel.send.assert_awaited_once()

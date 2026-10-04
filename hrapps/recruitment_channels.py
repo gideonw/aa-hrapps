@@ -74,7 +74,10 @@ def closed_application_discord_id(app_pk):
 async def ensure_recruitment_channel(guild, member, settings):
     """Point `member` at their recruitment channel, creating it if needed.
 
-    Returns the channel, or None when creation failed (already logged).
+    Returns the channel, or None for an operator-misconfiguration failure
+    (already logged). A registry-write failure during creation is not caught
+    here -- it propagates so the caller sees it rather than silently losing
+    the channel.
     """
     channel_id = await sync_to_async(get_open_channel_id)(member.id)
     if channel_id is not None:
