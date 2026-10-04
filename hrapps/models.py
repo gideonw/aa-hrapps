@@ -28,6 +28,9 @@ class HRAppDiscordSettings(SingletonModel):
     enable_welcome_messages = models.BooleanField(default=False)
     welcome_channel = models.BigIntegerField(null=True, blank=True)
     welcome_message = models.TextField(null=True, blank=True)
+    # Default True so existing installs keep the button they have today when
+    # this field arrives. ANDed with recruitment_mode at use, never alone.
+    welcome_include_recruit_button = models.BooleanField(default=True)
     ignored_states = models.ManyToManyField(allianceauth.authentication.models.State, blank=True)
 
     # Recruitment settings

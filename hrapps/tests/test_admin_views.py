@@ -114,3 +114,52 @@ class RecruitmentSettingsViewTests(TestCase):
         saved = HRAppDiscordSettings.get_solo()
         self.assertEqual(saved.recruit_role, 400)
         self.assertNotEqual(saved.recruit_role, saved.recruiter_role)
+
+class WelcomeSettingsViewTests(TestCase):
+    """Round-trips the welcome card's settings. follow=False and the explicit
+    main character are needed for the same reasons documented on
+    RecruitmentSettingsViewTests above."""
+
+    def setUp(self):
+        self.user = User.objects.create_superuser(
+            "welcomeadmin", "welcomeadmin@example.com", "password"
+        )
+        AuthUtils.add_main_character(
+            self.user,
+            "Welcome Admin",
+            "2",
+            corp_id=1,
+            corp_name="Test Corp",
+            corp_ticker="TEST",
+        )
+        self.user.refresh_from_db()
+        self.client.force_login(self.user)
+
+    def _post(self, **overrides):
+        data = {"welcome": "true", "channel": "500", "message": "hi {user_mention}"}
+        data.update(overrides)
+        with patch("hrapps.signals.get_redis_client"):
+            return self.client.post(reverse("hradmin:update_discord"), data)
+
+    def test_recruit_button_toggle_saves_when_ticked(self):
+        self._post(enabled="on", include_recruit_button="on")
+        saved = HRAppDiscordSettings.get_solo()
+        self.assertIs(saved.welcome_include_recruit_button, True)
+
+    def test_recruit_button_toggle_saves_when_unticked(self):
+        """An unchecked HTML checkbox posts no key at all, so the handler must
+        treat absence as False rather than leaving the previous value."""
+        self._post(enabled="on", include_recruit_button="on")
+        self._post(enabled="on")
+        saved = HRAppDiscordSettings.get_solo()
+        self.assertIs(saved.welcome_include_recruit_button, False)
+
+    def test_welcome_enabled_round_trips(self):
+        self._post(enabled="on")
+        self.assertIs(HRAppDiscordSettings.get_solo().enable_welcome_messages, True)
+
+    def test_welcome_message_and_channel_round_trip(self):
+        self._post(enabled="on", channel="12345", message="welcome {user_mention}")
+        saved = HRAppDiscordSettings.get_solo()
+        self.assertEqual(saved.welcome_channel, 12345)
+        self.assertEqual(saved.welcome_message, "welcome {user_mention}")

@@ -99,6 +99,30 @@ async def start_recruitment(guild, member, settings):
     return False
 
 
+def should_send_welcome(settings):
+    """Whether a joining member gets a welcome message at all.
+
+    enable_welcome_messages was saved by the admin view, constrained in the
+    model and rendered as a checkbox, but nothing here ever read it -- so the
+    toggle did nothing and welcomes fired regardless. A free function so the
+    guard is testable without constructing a member-join event.
+    """
+    return bool(settings.enable_welcome_messages)
+
+
+def welcome_recruit_button_enabled(settings):
+    """Whether the welcome message carries the Recruit Me button.
+
+    ANDed with the mode rather than independent: in off mode the button can
+    only answer "Recruitment is not currently open", and a button whose sole
+    function is to announce that it does nothing is worse than no button.
+    """
+    return (
+        settings.recruitment_mode != RecruitmentMode.OFF
+        and bool(settings.welcome_include_recruit_button)
+    )
+
+
 def wanted_subscriptions(settings):
     """Redis channels the cog needs given these settings.
 
@@ -451,6 +475,11 @@ class HRApps(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member):
         logger.debug(f"Member joined the server.")
+        # Checked before the ignored-state lookup below, which costs several
+        # queries: if welcomes are off there is nothing to decide.
+        if not should_send_welcome(self.settings):
+            logger.debug("Welcome messages are disabled; not welcoming.")
+            return
         # Check if the user is part of an ignored state, if so we can return, no need to welcome.
         try:
             if await sync_to_async(self._is_ignored_state)(member._user, member.guild):
@@ -470,7 +499,7 @@ class HRApps(commands.Cog):
         welcome_channel = self.bot.get_channel(self.settings.welcome_channel)
         recruit_view = (
             RecruitButtonView(self.bot, member)
-            if self.settings.recruitment_mode != RecruitmentMode.OFF
+            if welcome_recruit_button_enabled(self.settings)
             else None
         )
         await welcome_channel.send(

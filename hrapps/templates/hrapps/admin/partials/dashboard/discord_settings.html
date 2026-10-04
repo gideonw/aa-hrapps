@@ -14,6 +14,15 @@
                                 <input type="text" class="form-control" id="welcomeChannel" name="channel" value="{% if discord_settings.welcome_channel %}{{ discord_settings.welcome_channel }}{% endif %}">
                                 <label for="welcomeMessage">Welcome Message</label>
                                 <textarea class="form-control" id="welcomeMessage" name="message" rows="3">{% if discord_settings.welcome_message %}{{ discord_settings.welcome_message }}{% endif %}</textarea>
+                                <small class="form-text text-muted">
+                                    Placeholders: <code>{user_mention}</code> pings the member who just
+                                    joined, <code>{auth_url}</code> inserts this site's URL. Anything else
+                                    in braces renders as empty text rather than erroring.
+                                </small>
+                                <div class="form-check mt-2">
+                                    <input class="form-check-input" type="checkbox" name="include_recruit_button" id="welcomeIncludeRecruitButton" {% if discord_settings.welcome_include_recruit_button %}checked{% endif %}>
+                                    <label class="form-check-label" for="welcomeIncludeRecruitButton">Include the Recruit Me button</label>
+                                </div>
                                 <label for="welcomeIgnoredStates">Ignored States</label>
                                 <select class="form-control" id="welcomeIgnoredStates" name="ignored_states" multiple>
                                     {% for state in states %}
