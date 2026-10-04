@@ -110,9 +110,15 @@ class RecruitButtonView(discord.ui.View):
         settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
 
         await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
-        await start_recruitment(interaction.guild, self.member, settings)
+        started = await start_recruitment(interaction.guild, self.member, settings)
 
         await interaction.response.edit_message(view=None)
+        if not started:
+            await interaction.followup.send(
+                "Your recruitment channel could not be created. "
+                "Please contact a recruiter.",
+                ephemeral=True,
+            )
 
 
     @discord.ui.button(label="No Thanks", custom_id="hrapps_cancel_button")
