@@ -66,19 +66,34 @@ async def start_recruitment(guild, member, settings):
         return channel is not None
 
     if settings.recruitment_mode == RecruitmentMode.THREADS:
-        existing_thread = await check_active_threads(
-            member, guild, settings.recruitment_thread_channel
-        )
-        if existing_thread:
-            channel = guild.get_channel(existing_thread)
-            await channel.send(
-                f"{member.mention} here is your existing recruitment thread!"
+        try:
+            existing_thread = await check_active_threads(
+                member, guild, settings.recruitment_thread_channel
+            )
+            if existing_thread:
+                # get_thread, not get_channel: Guild.get_channel reads
+                # self._channels and its own docstring says it does *not* search
+                # threads, so it returns None for a thread id and the send below
+                # would raise AttributeError. In /recruit_me that escaped the
+                # command and the applicant saw "The application did not
+                # respond." The thread is in guild._threads because
+                # check_active_threads just found it through channel.threads.
+                thread = guild.get_thread(existing_thread)
+                await thread.send(
+                    f"{member.mention} here is your existing recruitment thread!"
+                )
+                return True
+            await create_recruitment_thread(
+                member, guild, settings.recruitment_thread_channel, settings.recruiter_role
             )
             return True
-        await create_recruitment_thread(
-            member, guild, settings.recruitment_thread_channel, settings.recruiter_role
-        )
-        return True
+        except Exception:
+            # Mirrors the channels branch above: report the failure honestly
+            # rather than letting it escape and leave the interaction unanswered.
+            logger.exception(
+                f"Failed to open a recruitment thread for {member.name}."
+            )
+            return False
 
     logger.debug("Recruitment is disabled; not opening a channel or thread.")
     return False
@@ -127,6 +142,19 @@ class RecruitButtonView(discord.ui.View):
             await interaction.response.send_message("You can not make this decision for others.", ephemeral=True)
             return
         settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+
+        # Mode first, role second. Granting recruit_role and then reporting
+        # "your channel could not be created" for a mode that never creates one
+        # is a lie no recruiter can act on, so OFF has to be answered before the
+        # applicant is given anything. on_member_join omits this view entirely
+        # when recruitment is off, so reaching here means the mode changed after
+        # the welcome message went out.
+        if settings.recruitment_mode == RecruitmentMode.OFF:
+            await interaction.response.edit_message(view=None)
+            await interaction.followup.send(
+                "Recruitment is not currently open.", ephemeral=True
+            )
+            return
 
         await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
         started = await start_recruitment(interaction.guild, self.member, settings)
@@ -480,6 +508,17 @@ class HRApps(commands.Cog):
                 return await ctx.respond("You are not eligible for recruitment.", ephemeral=True)
         except NotAuthenticated:
             pass
+
+        # Mode first, role second. start_recruitment returns False for OFF, so
+        # granting recruit_role first produced "your channel could not be
+        # created" when nothing had failed and no recruiter could fix it. This
+        # also covers the upgrade path: /recruit_me used to be ungated, so an
+        # install whose use_recruitment_threads checkbox was off migrates to
+        # mode `off` and must say why rather than imply a fault.
+        if self.settings.recruitment_mode == RecruitmentMode.OFF:
+            return await ctx.respond(
+                "Recruitment is not currently open.", ephemeral=True
+            )
 
         await add_recruit_role(ctx.author, ctx.guild, self.settings.recruit_role)
         started = await start_recruitment(ctx.guild, ctx.author, self.settings)
