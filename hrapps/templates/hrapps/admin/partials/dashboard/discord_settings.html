@@ -34,14 +34,25 @@
                         <form action="{% url 'hradmin:update_discord' %}" method="post">
                         {% csrf_token %}
                             <input type="hidden" name="recruitment" value="true">
-                            <div class="card-header">Recruitment Settings <div class="float-end"><input type="checkbox" name="enabled" {% if discord_settings.use_recruitment_threads %}checked{% endif %}/>&nbsp;<label for="recruitmentEnabled">Enabled?</label></div></div>
+                            <div class="card-header">Recruitment Settings</div>
                             <div class="card-body">
-                                <label for="recruitmentChannel">Recruitment Channel</label>
-                                <input type="text" class="form-control" id="recruitmentChannel" name="channel" value="{% if discord_settings.recruitment_thread_channel %}{{ discord_settings.recruitment_thread_channel }}{% endif %}">
+                                <label for="recruitmentMode">Mode</label>
+                                <select class="form-control" id="recruitmentMode" name="mode">
+                                    {% for value, label in recruitment_modes %}
+                                        <option value="{{ value }}" {% if discord_settings.recruitment_mode == value %}selected{% endif %}>{{ label }}</option>
+                                    {% endfor %}
+                                </select>
                                 <label for="recruitmentRole">Recruiter Role</label>
                                 <input type="text" class="form-control" id="recruitmentRole" name="role" value="{% if discord_settings.recruiter_role %}{{ discord_settings.recruiter_role }}{% endif %}">
                                 <label for="recruitmentRRole">Recruit Role</label>
                                 <input type="text" class="form-control" id="recruitmentRRole" name="rrole" value="{% if discord_settings.recruit_role %}{{ discord_settings.recruit_role }}{% endif %}">
+                                <hr>
+                                <label for="recruitmentChannel">Thread Channel <small class="text-muted">(threads mode)</small></label>
+                                <input type="text" class="form-control" id="recruitmentChannel" name="channel" value="{% if discord_settings.recruitment_thread_channel %}{{ discord_settings.recruitment_thread_channel }}{% endif %}">
+                                <label for="recruitmentCategory">Recruitment Category <small class="text-muted">(private channels mode)</small></label>
+                                <input type="text" class="form-control" id="recruitmentCategory" name="category" value="{% if discord_settings.recruitment_category %}{{ discord_settings.recruitment_category }}{% endif %}">
+                                <label for="recruitmentArchiveCategory">Archive Category <small class="text-muted">(private channels mode)</small></label>
+                                <input type="text" class="form-control" id="recruitmentArchiveCategory" name="archive_category" value="{% if discord_settings.recruitment_archive_category %}{{ discord_settings.recruitment_archive_category }}{% endif %}">
                             </div>
                             <div class="card-footer">
                                 <div class="text-end">

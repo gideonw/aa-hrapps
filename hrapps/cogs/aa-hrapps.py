@@ -12,7 +12,11 @@ from aadiscordbot.app_settings import get_all_servers, get_site_url
 from aadiscordbot.cogs.utils.exceptions import NotAuthenticated
 from asgiref.sync import sync_to_async
 from discord.ext import commands
-from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment
+from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment, RecruitmentMode
+from hrapps.recruitment_channels import (
+    archive_recruitment_channel,
+    ensure_recruitment_channel,
+)
 from allianceauth.eveonline.evelinks import eveimageserver
 
 logger = get_extension_logger(__name__)
@@ -45,6 +49,75 @@ async def create_recruitment_thread(member, guild, channel_id, recruiter_role_id
     await thread.send(f"*ATTN: {recruiter_role.mention}*\n\n{member.mention} has indicated they are interested in joining.")
 
 
+async def start_recruitment(guild, member, settings):
+    """Open or re-point the member's recruitment space for the configured mode.
+
+    Returns True when the member has somewhere to talk, False when channel
+    creation failed and the caller should say so rather than imply success.
+    """
+    if settings.recruitment_mode == RecruitmentMode.CHANNELS:
+        try:
+            channel = await ensure_recruitment_channel(guild, member, settings)
+        except Exception:
+            logger.exception(
+                f"Failed to open a recruitment channel for {member.name}."
+            )
+            return False
+        return channel is not None
+
+    if settings.recruitment_mode == RecruitmentMode.THREADS:
+        try:
+            existing_thread = await check_active_threads(
+                member, guild, settings.recruitment_thread_channel
+            )
+            if existing_thread:
+                # get_thread, not get_channel: Guild.get_channel reads
+                # self._channels and its own docstring says it does *not* search
+                # threads, so it returns None for a thread id and the send below
+                # would raise AttributeError. In /recruit_me that escaped the
+                # command and the applicant saw "The application did not
+                # respond." The thread is in guild._threads because
+                # check_active_threads just found it through channel.threads.
+                thread = guild.get_thread(existing_thread)
+                await thread.send(
+                    f"{member.mention} here is your existing recruitment thread!"
+                )
+                return True
+            await create_recruitment_thread(
+                member, guild, settings.recruitment_thread_channel, settings.recruiter_role
+            )
+            return True
+        except Exception:
+            # Mirrors the channels branch above: report the failure honestly
+            # rather than letting it escape and leave the interaction unanswered.
+            logger.exception(
+                f"Failed to open a recruitment thread for {member.name}."
+            )
+            return False
+
+    logger.debug("Recruitment is disabled; not opening a channel or thread.")
+    return False
+
+
+def wanted_subscriptions(settings):
+    """Redis channels the cog needs given these settings.
+
+    hrapp_application_notifications carries both the notification embeds and the
+    "application status changed" message that archives a recruitment channel, so
+    channels mode needs it even with notifications off.
+
+    A free function rather than a method so it can be tested without building a
+    cog, whose __init__ opens a Redis connection and spawns a task.
+    """
+    wanted = {"hrapp_discord_settings"}
+    if settings.enable_application_notifications:
+        wanted.add("hrapp_application_notifications")
+        wanted.add("hrapp_comment_notifications")
+    if settings.recruitment_mode == RecruitmentMode.CHANNELS:
+        wanted.add("hrapp_application_notifications")
+    return wanted
+
+
 class RecruitButtonView(discord.ui.View):
     def __init__(self, bot, member=None):
         super().__init__(timeout=None)
@@ -70,20 +143,29 @@ class RecruitButtonView(discord.ui.View):
             return
         settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
 
-        await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
-        existing_thread = await check_active_threads(self.member, interaction.guild, settings.recruitment_thread_channel)
-        if existing_thread:
-            channel = interaction.guild.get_channel(existing_thread)
-            await channel.send(f"{self.member.mention} here is your existing recruitment thread!")
-        else:
-            await create_recruitment_thread(
-                self.member,
-                interaction.guild,
-                settings.recruitment_thread_channel,
-                settings.recruiter_role
+        # Mode first, role second. Granting recruit_role and then reporting
+        # "your channel could not be created" for a mode that never creates one
+        # is a lie no recruiter can act on, so OFF has to be answered before the
+        # applicant is given anything. on_member_join omits this view entirely
+        # when recruitment is off, so reaching here means the mode changed after
+        # the welcome message went out.
+        if settings.recruitment_mode == RecruitmentMode.OFF:
+            await interaction.response.edit_message(view=None)
+            await interaction.followup.send(
+                "Recruitment is not currently open.", ephemeral=True
             )
+            return
+
+        await add_recruit_role(self.member, interaction.guild, settings.recruit_role)
+        started = await start_recruitment(interaction.guild, self.member, settings)
 
         await interaction.response.edit_message(view=None)
+        if not started:
+            await interaction.followup.send(
+                "Your recruitment channel could not be created. "
+                "Please contact a recruiter.",
+                ephemeral=True,
+            )
 
 
     @discord.ui.button(label="No Thanks", custom_id="hrapps_cancel_button")
@@ -124,16 +206,47 @@ class HRApps(commands.Cog):
         self.listener_task = self.bot.loop.create_task(self.listen_to_mq())
         logger.debug("Initialized HRApp cog.")
 
+    async def _reconcile_subscriptions(self):
+        """Subscribe and unsubscribe so the connection matches the settings.
+
+        Called on startup and after every settings update. Without the second
+        call, switching to channels mode in the admin UI appears to work and
+        silently archives nothing until someone restarts the bot.
+
+        Must only be called from inside the pubsub listen loop: redis-py's
+        unsubscribe only moves a channel to pending_unsubscribe_channels, and it
+        is popped from self.channels when listen() later reads the server's
+        confirmation -- so off the loop, self.channels never converges and every
+        reconcile re-issues the same unsubscribe.
+        """
+        wanted = wanted_subscriptions(self.settings)
+        current = set(self.pubsub.channels.keys())
+        for channel in wanted - current:
+            await self.pubsub.subscribe(channel)
+            logger.debug(f"Subscribed to {channel}")
+        for channel in current - wanted:
+            await self.pubsub.unsubscribe(channel)
+            logger.debug(f"Unsubscribed from {channel}")
+
     async def listen_to_mq(self):
-        await self.pubsub.subscribe("hrapp_discord_settings")
-        if self.settings.enable_application_notifications:
-            await self.pubsub.subscribe("hrapp_application_notifications")
-            await self.pubsub.subscribe("hrapp_comment_notifications")
+        await self._reconcile_subscriptions()
         logger.debug("Listening for HRApp settings updates.")
 
         try:
             async for message in self.pubsub.listen():
-                if message["type"] == "message":
+                if message["type"] != "message":
+                    continue
+                # Per-message isolation. The handlers below reach the database
+                # and the Discord API, so any one of them can raise: an
+                # application deleted between publish and receipt makes
+                # FormResponse.objects.get raise DoesNotExist, for instance.
+                # Without this try the exception leaves the `async for` -- the
+                # outer handler sits outside the loop -- and the subscription
+                # task ends for good: no settings reloads, no notifications and
+                # no archiving until the bot restarts. asyncio.CancelledError is
+                # a BaseException, so `except Exception` already lets
+                # cancellation propagate to the outer handler.
+                try:
                     logger.debug("Received redis message")
                     data = json.loads(message["data"])
                     action = data.get("action")
@@ -142,18 +255,42 @@ class HRApps(commands.Cog):
                     if action == "settings_updated":
                         logger.debug("HRApp settings updated, updating local settings.")
                         await self.update_settings()
+                    # Every notification below is gated on the notification
+                    # flag. Channels mode subscribes to
+                    # hrapp_application_notifications even with notifications
+                    # off, because archiving rides that channel; in that
+                    # configuration application_notification_channel is NULL,
+                    # bot.get_channel(None) returns None and channel.send raises
+                    # AttributeError. Ungated, the first application submitted
+                    # killed the listener and with it all archiving.
                     if action == "new application":
                         logger.debug("New HRApp application detected, sending notification.")
-                        await self.send_new_app_notification(data.get("app_pk"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_new_app_notification(data.get("app_pk"))
                     if action == "new comment":
                         logger.debug("New HRApp comment detected, sending notification.")
-                        await self.send_new_comment_notification(data.get("comment_pk"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_new_comment_notification(data.get("comment_pk"))
                     if action == "application claimed":
                         logger.debug("HRApp application claimed, sending notification.")
-                        await self.send_claim_notification(data.get("app_pk"), data.get("recruiter", True))
+                        if self.settings.enable_application_notifications:
+                            await self.send_claim_notification(data.get("app_pk"), data.get("recruiter", True))
                     if action == "application status changed":
                         logger.debug("HRApp application status changed, sending notification.")
-                        await self.send_status_notification(data.get("app_pk"), data.get("old"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_status_notification(
+                                data.get("app_pk"), data.get("old")
+                            )
+                        # Deliberately not gated on the notification flag:
+                        # archiving must run with notifications off.
+                        if self.settings.recruitment_mode == RecruitmentMode.CHANNELS:
+                            await archive_recruitment_channel(
+                                self.bot, data.get("app_pk"), self.settings
+                            )
+                except Exception:
+                    logger.exception(
+                        "Error handling an HRApp redis message; still listening."
+                    )
         except asyncio.CancelledError:
             logger.debug("Cancelled listening for HRApp settings updates.")
         except Exception as e:
@@ -298,6 +435,7 @@ class HRApps(commands.Cog):
         return embed
     async def update_settings(self):
         self.settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+        await self._reconcile_subscriptions()
 
     def _is_ignored_state(self, discord_user, guild):
         """Resolve the auth user and test their state against ignored_states.
@@ -328,9 +466,13 @@ class HRApps(commands.Cog):
 
         # Welcome the user
         logger.debug(f"Welcoming user {member.name}")
-        logger.debug(f"Use Recruitment Threads on? {self.settings.use_recruitment_threads}")
+        logger.debug(f"Recruitment mode: {self.settings.recruitment_mode}")
         welcome_channel = self.bot.get_channel(self.settings.welcome_channel)
-        recruit_view = RecruitButtonView(self.bot, member) if self.settings.use_recruitment_threads else None
+        recruit_view = (
+            RecruitButtonView(self.bot, member)
+            if self.settings.recruitment_mode != RecruitmentMode.OFF
+            else None
+        )
         await welcome_channel.send(
             self.settings.welcome_message.format_map(
                 defaultdict(
@@ -344,7 +486,8 @@ class HRApps(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not self.settings.use_recruitment_threads:
+        # Only threads announce themselves with a system message to delete.
+        if self.settings.recruitment_mode != RecruitmentMode.THREADS:
             return
 
         logger.debug(f"Message type: {message.type}")
@@ -366,22 +509,26 @@ class HRApps(commands.Cog):
         except NotAuthenticated:
             pass
 
+        # Mode first, role second. start_recruitment returns False for OFF, so
+        # granting recruit_role first produced "your channel could not be
+        # created" when nothing had failed and no recruiter could fix it. This
+        # also covers the upgrade path: /recruit_me used to be ungated, so an
+        # install whose use_recruitment_threads checkbox was off migrates to
+        # mode `off` and must say why rather than imply a fault.
+        if self.settings.recruitment_mode == RecruitmentMode.OFF:
+            return await ctx.respond(
+                "Recruitment is not currently open.", ephemeral=True
+            )
+
         await add_recruit_role(ctx.author, ctx.guild, self.settings.recruit_role)
-        existing_thread = await check_active_threads(ctx.author, ctx.guild, self.settings.recruitment_thread_channel)
-        if existing_thread:
-            print(existing_thread)
-            channel = await self.bot.fetch_channel(existing_thread)
-            print(channel)
-            await channel.send(f"{ctx.author.mention} here is your existing recruitment thread!")
-            return await ctx.respond("You have already started the recruitment process.\n"
-                                     "Please check for your recruitment thread.", ephemeral=True)
-        await create_recruitment_thread(
-            ctx.author,
-            ctx.guild,
-            self.settings.recruitment_thread_channel,
-            self.settings.recruiter_role
-        )
-        return await ctx.respond("Your recruitment thread has been created.", ephemeral=True)
+        started = await start_recruitment(ctx.guild, ctx.author, self.settings)
+        if not started:
+            return await ctx.respond(
+                "Your recruitment channel could not be created. "
+                "Please contact a recruiter.",
+                ephemeral=True,
+            )
+        return await ctx.respond("Your recruitment channel is ready.", ephemeral=True)
 
 
 def setup(bot):
