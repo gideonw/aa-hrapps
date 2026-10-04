@@ -84,6 +84,25 @@ async def start_recruitment(guild, member, settings):
     return False
 
 
+def wanted_subscriptions(settings):
+    """Redis channels the cog needs given these settings.
+
+    hrapp_application_notifications carries both the notification embeds and the
+    "application status changed" message that archives a recruitment channel, so
+    channels mode needs it even with notifications off.
+
+    A free function rather than a method so it can be tested without building a
+    cog, whose __init__ opens a Redis connection and spawns a task.
+    """
+    wanted = {"hrapp_discord_settings"}
+    if settings.enable_application_notifications:
+        wanted.add("hrapp_application_notifications")
+        wanted.add("hrapp_comment_notifications")
+    if settings.recruitment_mode == RecruitmentMode.CHANNELS:
+        wanted.add("hrapp_application_notifications")
+    return wanted
+
+
 class RecruitButtonView(discord.ui.View):
     def __init__(self, bot, member=None):
         super().__init__(timeout=None)
@@ -159,11 +178,24 @@ class HRApps(commands.Cog):
         self.listener_task = self.bot.loop.create_task(self.listen_to_mq())
         logger.debug("Initialized HRApp cog.")
 
+    async def _reconcile_subscriptions(self):
+        """Subscribe and unsubscribe so the connection matches the settings.
+
+        Called on startup and after every settings update. Without the second
+        call, switching to channels mode in the admin UI appears to work and
+        silently archives nothing until someone restarts the bot.
+        """
+        wanted = wanted_subscriptions(self.settings)
+        current = set(self.pubsub.channels.keys())
+        for channel in wanted - current:
+            await self.pubsub.subscribe(channel)
+            logger.debug(f"Subscribed to {channel}")
+        for channel in current - wanted:
+            await self.pubsub.unsubscribe(channel)
+            logger.debug(f"Unsubscribed from {channel}")
+
     async def listen_to_mq(self):
-        await self.pubsub.subscribe("hrapp_discord_settings")
-        if self.settings.enable_application_notifications:
-            await self.pubsub.subscribe("hrapp_application_notifications")
-            await self.pubsub.subscribe("hrapp_comment_notifications")
+        await self._reconcile_subscriptions()
         logger.debug("Listening for HRApp settings updates.")
 
         try:
@@ -341,6 +373,7 @@ class HRApps(commands.Cog):
         return embed
     async def update_settings(self):
         self.settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+        await self._reconcile_subscriptions()
 
     def _is_ignored_state(self, discord_user, guild):
         """Resolve the auth user and test their state against ignored_states.
