@@ -184,6 +184,12 @@ class HRApps(commands.Cog):
         Called on startup and after every settings update. Without the second
         call, switching to channels mode in the admin UI appears to work and
         silently archives nothing until someone restarts the bot.
+
+        Must only be called from inside the pubsub listen loop: redis-py's
+        unsubscribe only moves a channel to pending_unsubscribe_channels, and it
+        is popped from self.channels when listen() later reads the server's
+        confirmation -- so off the loop, self.channels never converges and every
+        reconcile re-issues the same unsubscribe.
         """
         wanted = wanted_subscriptions(self.settings)
         current = set(self.pubsub.channels.keys())
@@ -200,7 +206,19 @@ class HRApps(commands.Cog):
 
         try:
             async for message in self.pubsub.listen():
-                if message["type"] == "message":
+                if message["type"] != "message":
+                    continue
+                # Per-message isolation. The handlers below reach the database
+                # and the Discord API, so any one of them can raise: an
+                # application deleted between publish and receipt makes
+                # FormResponse.objects.get raise DoesNotExist, for instance.
+                # Without this try the exception leaves the `async for` -- the
+                # outer handler sits outside the loop -- and the subscription
+                # task ends for good: no settings reloads, no notifications and
+                # no archiving until the bot restarts. asyncio.CancelledError is
+                # a BaseException, so `except Exception` already lets
+                # cancellation propagate to the outer handler.
+                try:
                     logger.debug("Received redis message")
                     data = json.loads(message["data"])
                     action = data.get("action")
@@ -209,26 +227,42 @@ class HRApps(commands.Cog):
                     if action == "settings_updated":
                         logger.debug("HRApp settings updated, updating local settings.")
                         await self.update_settings()
+                    # Every notification below is gated on the notification
+                    # flag. Channels mode subscribes to
+                    # hrapp_application_notifications even with notifications
+                    # off, because archiving rides that channel; in that
+                    # configuration application_notification_channel is NULL,
+                    # bot.get_channel(None) returns None and channel.send raises
+                    # AttributeError. Ungated, the first application submitted
+                    # killed the listener and with it all archiving.
                     if action == "new application":
                         logger.debug("New HRApp application detected, sending notification.")
-                        await self.send_new_app_notification(data.get("app_pk"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_new_app_notification(data.get("app_pk"))
                     if action == "new comment":
                         logger.debug("New HRApp comment detected, sending notification.")
-                        await self.send_new_comment_notification(data.get("comment_pk"))
+                        if self.settings.enable_application_notifications:
+                            await self.send_new_comment_notification(data.get("comment_pk"))
                     if action == "application claimed":
                         logger.debug("HRApp application claimed, sending notification.")
-                        await self.send_claim_notification(data.get("app_pk"), data.get("recruiter", True))
+                        if self.settings.enable_application_notifications:
+                            await self.send_claim_notification(data.get("app_pk"), data.get("recruiter", True))
                     if action == "application status changed":
                         logger.debug("HRApp application status changed, sending notification.")
                         if self.settings.enable_application_notifications:
                             await self.send_status_notification(
                                 data.get("app_pk"), data.get("old")
                             )
+                        # Deliberately not gated on the notification flag:
+                        # archiving must run with notifications off.
                         if self.settings.recruitment_mode == RecruitmentMode.CHANNELS:
-                            for guild in self.bot.guilds:
-                                await archive_recruitment_channel(
-                                    guild, data.get("app_pk"), self.settings
-                                )
+                            await archive_recruitment_channel(
+                                self.bot, data.get("app_pk"), self.settings
+                            )
+                except Exception:
+                    logger.exception(
+                        "Error handling an HRApp redis message; still listening."
+                    )
         except asyncio.CancelledError:
             logger.debug("Cancelled listening for HRApp settings updates.")
         except Exception as e:

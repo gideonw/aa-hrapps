@@ -91,8 +91,8 @@ async def ensure_recruitment_channel(guild, member, settings):
         # unique index on open_for_user rejects every future attempt by this
         # member, wedging them permanently with no route out but a DBA.
         logger.info(
-            f"Recruitment channel {channel_id} for {member.name} is gone; "
-            f"retiring the stale registry row."
+            f"Recruitment channel {channel_id} for {member.name} ({member.id}) is "
+            f"gone; retiring the stale registry row."
         )
         await sync_to_async(mark_archived)(channel_id)
 
@@ -104,7 +104,7 @@ async def _create_recruitment_channel(guild, member, settings):
     if not isinstance(category, discord.CategoryChannel):
         logger.error(
             f"recruitment_category {settings.recruitment_category} is missing or is "
-            f"not a category; cannot create a channel for {member.name}."
+            f"not a category; cannot create a channel for {member.name} ({member.id})."
         )
         return None
 
@@ -112,7 +112,8 @@ async def _create_recruitment_channel(guild, member, settings):
     if recruiter_role is None:
         logger.error(
             f"recruiter_role {settings.recruiter_role} not found in {guild.name}; "
-            f"refusing to create a channel that only {member.name} could see."
+            f"refusing to create a channel that only {member.name} ({member.id}) "
+            f"could see."
         )
         return None
 
@@ -139,12 +140,13 @@ async def _create_recruitment_channel(guild, member, settings):
     except discord.Forbidden:
         logger.error(
             f"Missing Manage Channels or Manage Roles in category "
-            f"{settings.recruitment_category}; cannot create a channel for {member.name}."
+            f"{settings.recruitment_category}; cannot create a channel for "
+            f"{member.name} ({member.id})."
         )
         return None
     except discord.HTTPException as e:
         logger.error(
-            f"Discord refused a channel for {member.name} in category "
+            f"Discord refused a channel for {member.name} ({member.id}) in category "
             f"{settings.recruitment_category}: {e}. A category holds at most 50 "
             f"channels -- check whether it is full."
         )
@@ -157,7 +159,8 @@ async def _create_recruitment_channel(guild, member, settings):
         # and the member would be handed a second one next time. Deleting it is
         # the only ordering that leaves Discord and the registry agreeing.
         logger.exception(
-            f"Failed to record channel {channel.id} for {member.name}; deleting it."
+            f"Failed to record channel {channel.id} for {member.name} "
+            f"({member.id}); deleting it."
         )
         await channel.delete(reason="hrapps: registry write failed")
         raise
@@ -169,12 +172,23 @@ async def _create_recruitment_channel(guild, member, settings):
     return channel
 
 
-async def archive_recruitment_channel(guild, app_pk, settings):
+async def archive_recruitment_channel(bot, app_pk, settings):
     """Drop the applicant's access and move their channel to the archive.
 
     Called on the "application status changed" message, which also fires for
     transitions that are not closures; closed_application_discord_id returns
     None for those, so this is a no-op unless the application really closed.
+
+    Takes the bot rather than a guild, and derives the guild from the resolved
+    channel. The caller used to loop over bot.guilds calling this once per
+    guild, which wedges as soon as the bot is in more than one guild -- a single
+    dev guild is enough, since bot.guilds is not filtered by get_all_servers().
+    guild.get_channel returns None for a channel that lives in a *different*
+    guild, this function reads that as "deleted by hand" and stamps the row, and
+    the correct guild's pass then finds nothing open and returns. The applicant's
+    overwrite is never removed, the channel never moves, and the closed row
+    means nothing ever retries. Resolving once also drops three duplicated
+    queries per guild per status change.
     """
     discord_user_id = await sync_to_async(closed_application_discord_id)(app_pk)
     if discord_user_id is None:
@@ -185,12 +199,17 @@ async def archive_recruitment_channel(guild, app_pk, settings):
         # They never ran /recruit_me, or it was archived already.
         return
 
-    channel = guild.get_channel(channel_id)
+    # Client.get_channel delegates to ConnectionState.get_channel, which walks
+    # every guild and resolves threads as well as channels, so unlike
+    # Guild.get_channel it is not scoped to one guild.
+    channel = bot.get_channel(channel_id)
     if channel is None:
         # Deleted by hand. Nothing to move, but retire the row so the member is
         # not blocked if they ever apply again.
         await sync_to_async(mark_archived)(channel_id)
         return
+
+    guild = channel.guild
 
     archive = guild.get_channel(settings.recruitment_archive_category)
     if not isinstance(archive, discord.CategoryChannel):
@@ -201,6 +220,30 @@ async def archive_recruitment_channel(guild, app_pk, settings):
         return
 
     member = guild.get_member(discord_user_id)
+    if member is None:
+        # get_member returning None means "not in the member cache", which is
+        # not the same as "left the guild". A present-but-uncached member must
+        # still have their overwrite removed the normal way, so ask Discord
+        # rather than assuming they are gone.
+        try:
+            member = await guild.fetch_member(discord_user_id)
+        except discord.NotFound:
+            logger.info(
+                f"Applicant {discord_user_id} has left {guild.name}; their stale "
+                f"overwrite on channel {channel_id} is stripped by the archive move."
+            )
+        except discord.HTTPException as e:
+            # Unresolved rather than known-departed. Falls through to the same
+            # overwrite-rebuild path below: it is the only route that still
+            # removes their access, and returning here would leave the row open
+            # with no later status change to retry on -- the application is
+            # already closed -- so a closed conversation would stay readable.
+            logger.error(
+                f"Could not resolve applicant {discord_user_id} in {guild.name}: "
+                f"{e}. Treating them as unresolved and stripping their overwrite "
+                f"from channel {channel_id} with the archive move."
+            )
+
     if member is not None:
         try:
             await channel.set_permissions(member, overwrite=None)
@@ -214,12 +257,34 @@ async def archive_recruitment_channel(guild, app_pk, settings):
             )
             return
 
+    # sync_permissions=False is load-bearing: syncing would replace this
+    # channel's overwrites with the archive category's, undoing the access
+    # removal above and potentially re-exposing the conversation just closed.
+    edit_kwargs = {"category": archive, "sync_permissions": False}
+
+    if member is None:
+        # The applicant could not be resolved to a Member, so set_permissions
+        # cannot target them -- py-cord rejects anything that is not a Member or
+        # a Role -- and their raw overwrite would survive on Discord's side.
+        # That is not harmless: rejoining the guild restores their view of the
+        # closed conversation, including anything recruiters said after closure,
+        # and applicants rejoining is routine. GuildChannel.overwrites resolves
+        # each target through guild.get_role/get_member and silently drops the
+        # ones it cannot resolve (py-cord carries its own "potential data loss
+        # here" TODO at that spot), so rebuilding the map from that dict view
+        # and sending it back in this same edit both moves the channel and
+        # strips the stale entry.
+        #
+        # Collateral behaviour, recorded on purpose: the rebuild also drops any
+        # *other* unresolvable overwrite target on this channel -- a deleted
+        # role, another uncached member. The fetch_member attempt above means
+        # the applicant is resolved whenever they are resolvable, so what is
+        # left here is genuinely unresolvable and dropping it is acceptable, but
+        # the next reader needs to know it happens.
+        edit_kwargs["overwrites"] = dict(channel.overwrites)
+
     try:
-        # sync_permissions=False is load-bearing: syncing would replace this
-        # channel's overwrites with the archive category's, undoing the
-        # access removal above and potentially re-exposing the conversation
-        # just closed.
-        await channel.edit(category=archive, sync_permissions=False)
+        await channel.edit(**edit_kwargs)
     except discord.Forbidden:
         # The applicant's overwrite is already gone, so this channel is no
         # longer theirs regardless of whether the category move succeeded.
@@ -230,6 +295,18 @@ async def archive_recruitment_channel(guild, app_pk, settings):
         logger.error(
             f"Applicant access to channel {channel_id} was removed, but missing "
             f"permissions to move it to the archive category; file it by hand."
+        )
+    except discord.HTTPException as e:
+        # Same reasoning as Forbidden above, and Forbidden has to stay first
+        # because it subclasses HTTPException. A full archive category lands
+        # here rather than in the Forbidden branch; without this handler the
+        # exception escaped with the applicant's access already removed and the
+        # row still open, so their next /recruit_me handed back a channel they
+        # could no longer see.
+        logger.error(
+            f"Applicant access to channel {channel_id} was removed, but Discord "
+            f"refused the move to the archive category: {e}. A category holds at "
+            f"most 50 channels -- check whether the archive is full. File it by hand."
         )
 
     await sync_to_async(mark_archived)(channel_id)
