@@ -11,7 +11,7 @@ from django.conf import settings
 from allianceauth.services.hooks import get_extension_logger
 from allianceauth.eveonline.models import EveCorporationInfo
 
-from hrapps.models import Form, FormResponse, HRAppDiscordSettings
+from hrapps.models import Form, FormResponse, HRAppDiscordSettings, RecruitmentMode
 from . import Field, get_application_context, add_comment, add_reply, process_after_app_attachments
 
 logger = get_extension_logger(__name__)
@@ -38,6 +38,7 @@ def dashboard(request):
     discordbot_installed = "aadiscordbot" in settings.INSTALLED_APPS
     discord_settings = HRAppDiscordSettings.get_solo()
     states = State.objects.all()
+    recruitment_modes = RecruitmentMode.choices
 
     return render(
         request,
@@ -47,6 +48,7 @@ def dashboard(request):
             "discordbot_installed": discordbot_installed,
             "discord_settings": discord_settings,
             "states": states,
+            "recruitment_modes": recruitment_modes,
         })
 
 
@@ -487,34 +489,50 @@ def update_discord_welcome_settings(request):
 @permissions_required(("hrapps.manage_hrapps",))
 def update_discord_recruitment_settings(request):
     data = request.POST
-    recruitmentEnabled = data.get("enabled")
-    recruitmentChannel = data.get("channel")
-    recruiterRole = data.get("role")
-    recruitRole = data.get("rrole")
+    mode = data.get("mode")
+    recruitmentChannel = data.get("channel") or None
+    recruitmentCategory = data.get("category") or None
+    recruitmentArchive = data.get("archive_category") or None
+    recruiterRole = data.get("role") or None
+    recruitRole = data.get("rrole") or None
 
-    if recruitmentChannel == "":
-        recruitmentChannel = None
+    if mode not in RecruitmentMode.values:
+        messages.error(request, "Unknown recruitment mode.")
+        return False
 
-    if recruiterRole == "":
-        recruiterRole = None
+    # Validate here rather than letting the check constraints raise. An
+    # IntegrityError surfaces as the caller's generic "Failed to update discord
+    # settings", which does not say which field is missing.
+    if mode == RecruitmentMode.THREADS and recruitmentChannel is None:
+        messages.error(request, "Threads mode requires a thread channel.")
+        return False
 
-    if recruitRole == "":
-        recruitRole = None
-
-    if recruitmentEnabled == "on":
-        recruitmentEnabled = True
-    else:
-        recruitmentEnabled = False
+    if mode == RecruitmentMode.CHANNELS:
+        missing = []
+        if recruitmentCategory is None:
+            missing.append("a recruitment category")
+        if recruitmentArchive is None:
+            missing.append("an archive category")
+        if recruiterRole is None:
+            missing.append("a recruiter role")
+        if missing:
+            messages.error(
+                request, f"Private channels mode requires {', '.join(missing)}."
+            )
+            return False
 
     try:
         discord_settings = HRAppDiscordSettings.get_solo()
-        discord_settings.use_recruitment_threads = recruitmentEnabled
+        discord_settings.recruitment_mode = mode
         discord_settings.recruitment_thread_channel = recruitmentChannel
+        discord_settings.recruitment_category = recruitmentCategory
+        discord_settings.recruitment_archive_category = recruitmentArchive
         discord_settings.recruiter_role = recruiterRole
         discord_settings.recruit_role = recruitRole
         discord_settings.save()
     except Exception as e:
         logger.error(f"Failed to update discord recruitment settings: {e}")
+        logger.exception(e)
         return False
 
     return True

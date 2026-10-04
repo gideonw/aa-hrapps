@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
@@ -40,7 +42,12 @@ class RecruitmentChannelTests(TestCase):
 class RecruitmentSettingsConstraintTests(TestCase):
     """IntegrityError marks the transaction broken, so each failing save is
     wrapped in its own atomic block or the next query raises
-    TransactionManagementError instead of what the test is about."""
+    TransactionManagementError instead of what the test is about.
+
+    Every save() below is wrapped in patch("hrapps.signals.get_redis_client"):
+    HRAppDiscordSettings' post_save signal (hrapps.signals.announce_update)
+    publishes to Redis unconditionally, and the test container shares its
+    Redis service with the deployment."""
 
     def _settings(self, **kwargs):
         instance = HRAppDiscordSettings.get_solo()
@@ -52,8 +59,9 @@ class RecruitmentSettingsConstraintTests(TestCase):
         instance = self._settings(
             recruitment_mode=RecruitmentMode.THREADS, recruitment_thread_channel=None
         )
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            instance.save()
+        with patch("hrapps.signals.get_redis_client"):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                instance.save()
 
     def test_channels_mode_requires_categories_and_recruiter_role(self):
         instance = self._settings(
@@ -62,8 +70,9 @@ class RecruitmentSettingsConstraintTests(TestCase):
             recruitment_archive_category=None,
             recruiter_role=None,
         )
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            instance.save()
+        with patch("hrapps.signals.get_redis_client"):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                instance.save()
 
     def test_channels_mode_requires_the_recruiter_role_specifically(self):
         """A null recruiter_role would produce a channel only the applicant can
@@ -74,8 +83,9 @@ class RecruitmentSettingsConstraintTests(TestCase):
             recruitment_archive_category=2,
             recruiter_role=None,
         )
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            instance.save()
+        with patch("hrapps.signals.get_redis_client"):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                instance.save()
 
     def test_channels_mode_saves_when_fully_configured(self):
         instance = self._settings(
@@ -84,7 +94,8 @@ class RecruitmentSettingsConstraintTests(TestCase):
             recruitment_archive_category=2,
             recruiter_role=3,
         )
-        instance.save()
+        with patch("hrapps.signals.get_redis_client"):
+            instance.save()
         self.assertEqual(
             HRAppDiscordSettings.get_solo().recruitment_mode, RecruitmentMode.CHANNELS
         )
@@ -95,4 +106,5 @@ class RecruitmentSettingsConstraintTests(TestCase):
             recruitment_thread_channel=None,
             recruitment_category=None,
         )
-        instance.save()
+        with patch("hrapps.signals.get_redis_client"):
+            instance.save()
