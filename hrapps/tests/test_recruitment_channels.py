@@ -99,3 +99,139 @@ class ClosedApplicationDiscordIdTests(TestCase):
         ):
             result = rc.closed_application_discord_id(application.pk)
         self.assertEqual(result, 444)
+
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
+from django.test import SimpleTestCase
+
+
+def _guild_and_category():
+    guild = MagicMock()
+    guild.default_role = MagicMock()
+    guild.me = MagicMock()
+    guild.get_role.return_value = MagicMock()
+
+    channel = MagicMock()
+    channel.id = 999
+    channel.send = AsyncMock()
+    channel.delete = AsyncMock()
+
+    # spec= makes isinstance(category, discord.CategoryChannel) true, which the
+    # implementation checks before using it.
+    category = MagicMock(spec=discord.CategoryChannel)
+    category.create_text_channel = AsyncMock(return_value=channel)
+
+    guild.get_channel.return_value = category
+    return guild, category, channel
+
+
+def _member(user_id=111, username="testuser"):
+    member = MagicMock()
+    member.id = user_id
+    # `name` is assigned after construction on purpose: MagicMock(name="x") sets
+    # the mock's own repr name, not an attribute, so .name would not be a str.
+    member.name = username
+    member.mention = f"<@{user_id}>"
+    return member
+
+
+def _channels_settings():
+    return MagicMock(recruitment_category=1, recruiter_role=2, recruitment_archive_category=3)
+
+
+class CreateChannelTests(SimpleTestCase):
+    async def test_everyone_is_denied_view_channel(self):
+        """Review Focus 1. If this regresses, every applicant conversation is
+        world-readable and nothing in the product says so."""
+        guild, category, _ = _guild_and_category()
+        with patch.object(rc, "record_channel"):
+            await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
+        self.assertFalse(overwrites[guild.default_role].view_channel)
+
+    async def test_recruiter_role_can_view_the_channel(self):
+        guild, category, _ = _guild_and_category()
+        role = guild.get_role.return_value
+        with patch.object(rc, "record_channel"):
+            await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
+        self.assertTrue(overwrites[role].view_channel)
+
+    async def test_applicant_can_view_the_channel(self):
+        guild, category, _ = _guild_and_category()
+        member = _member()
+        with patch.object(rc, "record_channel"):
+            await rc._create_recruitment_channel(guild, member, _channels_settings())
+        overwrites = category.create_text_channel.call_args.kwargs["overwrites"]
+        self.assertTrue(overwrites[member].view_channel)
+
+    async def test_failed_registry_write_deletes_the_channel(self):
+        """An unrecorded channel is invisible to every later lookup, so it would
+        leak and hand the member a second one next time."""
+        guild, _, channel = _guild_and_category()
+        with patch.object(rc, "record_channel", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        channel.delete.assert_awaited()
+
+    async def test_forbidden_returns_none_rather_than_raising(self):
+        guild, category, _ = _guild_and_category()
+        category.create_text_channel.side_effect = discord.Forbidden(MagicMock(), "nope")
+        result = await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIsNone(result)
+
+    async def test_full_category_returns_none_rather_than_raising(self):
+        guild, category, _ = _guild_and_category()
+        category.create_text_channel.side_effect = discord.HTTPException(MagicMock(), "full")
+        result = await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIsNone(result)
+
+    async def test_missing_recruiter_role_creates_nothing(self):
+        """Creating it anyway would make a channel only the applicant can see."""
+        guild, category, _ = _guild_and_category()
+        guild.get_role.return_value = None
+        result = await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIsNone(result)
+        category.create_text_channel.assert_not_awaited()
+
+    async def test_non_category_id_creates_nothing(self):
+        guild, category, _ = _guild_and_category()
+        guild.get_channel.return_value = MagicMock()  # not a CategoryChannel
+        result = await rc._create_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIsNone(result)
+
+
+class EnsureChannelTests(SimpleTestCase):
+    async def test_existing_channel_is_reused(self):
+        guild, category, _ = _guild_and_category()
+        existing = MagicMock()
+        existing.send = AsyncMock()
+        guild.get_channel.return_value = existing
+        with patch.object(rc, "get_open_channel_id", return_value=555):
+            result = await rc.ensure_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIs(result, existing)
+        existing.send.assert_awaited()
+        category.create_text_channel.assert_not_awaited()
+
+    async def test_stale_row_is_retired_and_a_new_channel_created(self):
+        """Review Focus 2. Without retiring the row, the unique index on
+        open_for_user blocks this member from ever starting again."""
+        guild, category, channel = _guild_and_category()
+        # First lookup is the missing channel; second is the category.
+        guild.get_channel.side_effect = [None, category]
+        with patch.object(rc, "get_open_channel_id", return_value=555), \
+             patch.object(rc, "mark_archived") as marked, \
+             patch.object(rc, "record_channel"):
+            result = await rc.ensure_recruitment_channel(guild, _member(), _channels_settings())
+        marked.assert_called_once_with(555)
+        self.assertIs(result, channel)
+
+    async def test_no_existing_row_creates_a_channel(self):
+        guild, category, channel = _guild_and_category()
+        with patch.object(rc, "get_open_channel_id", return_value=None), \
+             patch.object(rc, "record_channel"):
+            result = await rc.ensure_recruitment_channel(guild, _member(), _channels_settings())
+        self.assertIs(result, channel)
+        category.create_text_channel.assert_awaited_once()

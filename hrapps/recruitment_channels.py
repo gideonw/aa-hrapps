@@ -69,3 +69,98 @@ def closed_application_discord_id(app_pk):
             f"Application {app_pk} has no linked Discord account; nothing to archive."
         )
         return None
+
+
+async def ensure_recruitment_channel(guild, member, settings):
+    """Point `member` at their recruitment channel, creating it if needed.
+
+    Returns the channel, or None when creation failed (already logged).
+    """
+    channel_id = await sync_to_async(get_open_channel_id)(member.id)
+    if channel_id is not None:
+        channel = guild.get_channel(channel_id)
+        if channel is not None:
+            await channel.send(
+                f"{member.mention} here is your existing recruitment channel!"
+            )
+            return channel
+        # The channel was deleted outside the app. Retire the stale row or the
+        # unique index on open_for_user rejects every future attempt by this
+        # member, wedging them permanently with no route out but a DBA.
+        logger.info(
+            f"Recruitment channel {channel_id} for {member.name} is gone; "
+            f"retiring the stale registry row."
+        )
+        await sync_to_async(mark_archived)(channel_id)
+
+    return await _create_recruitment_channel(guild, member, settings)
+
+
+async def _create_recruitment_channel(guild, member, settings):
+    category = guild.get_channel(settings.recruitment_category)
+    if not isinstance(category, discord.CategoryChannel):
+        logger.error(
+            f"recruitment_category {settings.recruitment_category} is missing or is "
+            f"not a category; cannot create a channel for {member.name}."
+        )
+        return None
+
+    recruiter_role = guild.get_role(settings.recruiter_role)
+    if recruiter_role is None:
+        logger.error(
+            f"recruiter_role {settings.recruiter_role} not found in {guild.name}; "
+            f"refusing to create a channel that only {member.name} could see."
+        )
+        return None
+
+    # The @everyone deny is the entire privacy mechanism. The explicit guild.me
+    # entry keeps the bot able to edit the channel later even though the category
+    # hides it by default.
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        ),
+        recruiter_role: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_channels=True
+        ),
+    }
+
+    try:
+        channel = await category.create_text_channel(
+            name=f"recruit-{member.name}", overwrites=overwrites
+        )
+    except discord.Forbidden:
+        logger.error(
+            f"Missing Manage Channels or Manage Roles in category "
+            f"{settings.recruitment_category}; cannot create a channel for {member.name}."
+        )
+        return None
+    except discord.HTTPException as e:
+        logger.error(
+            f"Discord refused a channel for {member.name} in category "
+            f"{settings.recruitment_category}: {e}. A category holds at most 50 "
+            f"channels -- check whether it is full."
+        )
+        return None
+
+    try:
+        await sync_to_async(record_channel)(member.id, channel.id)
+    except Exception:
+        # An unrecorded channel is invisible to every later lookup: it would leak
+        # and the member would be handed a second one next time. Deleting it is
+        # the only ordering that leaves Discord and the registry agreeing.
+        logger.exception(
+            f"Failed to record channel {channel.id} for {member.name}; deleting it."
+        )
+        await channel.delete(reason="hrapps: registry write failed")
+        raise
+
+    await channel.send(
+        f"*ATTN: {recruiter_role.mention}*\n\n"
+        f"{member.mention} has indicated they are interested in joining."
+    )
+    return channel
