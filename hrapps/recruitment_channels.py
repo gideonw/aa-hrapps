@@ -201,18 +201,36 @@ async def archive_recruitment_channel(guild, app_pk, settings):
         return
 
     member = guild.get_member(discord_user_id)
-    try:
-        if member is not None:
+    if member is not None:
+        try:
             await channel.set_permissions(member, overwrite=None)
+        except discord.Forbidden:
+            # Nothing has changed yet: the applicant still has access and the
+            # row stays open, so an operator can fix permissions and the next
+            # status change will retry this from scratch.
+            logger.error(
+                f"Missing permissions to remove access from channel {channel_id}; "
+                f"leaving it in place."
+            )
+            return
+
+    try:
         # sync_permissions=False is load-bearing: syncing would replace this
-        # channel's overwrites with the archive category's, undoing the line
-        # above and potentially re-exposing the conversation just closed.
+        # channel's overwrites with the archive category's, undoing the
+        # access removal above and potentially re-exposing the conversation
+        # just closed.
         await channel.edit(category=archive, sync_permissions=False)
     except discord.Forbidden:
+        # The applicant's overwrite is already gone, so this channel is no
+        # longer theirs regardless of whether the category move succeeded.
+        # Stamp it anyway: not stamping here would wedge the applicant the
+        # same way an unstamped row wedges channel creation -- they would be
+        # handed back a channel they can no longer see on their next
+        # application.
         logger.error(
-            f"Missing permissions to archive channel {channel_id}; leaving it in place."
+            f"Applicant access to channel {channel_id} was removed, but missing "
+            f"permissions to move it to the archive category; file it by hand."
         )
-        return
 
     await sync_to_async(mark_archived)(channel_id)
     await channel.send("This application is closed. This channel has been archived.")

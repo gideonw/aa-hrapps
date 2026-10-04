@@ -319,3 +319,27 @@ class ArchiveChannelTests(SimpleTestCase):
             await rc.archive_recruitment_channel(guild, 1, _channels_settings())
         channel.edit.assert_not_awaited()
         marked.assert_not_called()
+
+    async def test_forbidden_removing_access_leaves_the_channel_untouched(self):
+        """Nothing has changed yet, so the row must stay open: an operator can
+        fix permissions and the next status change retries from scratch."""
+        guild, channel, _, _ = _archive_guild()
+        channel.set_permissions.side_effect = discord.Forbidden(MagicMock(), "nope")
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        channel.edit.assert_not_awaited()
+        marked.assert_not_called()
+
+    async def test_forbidden_moving_channel_still_stamps_the_row(self):
+        """Regression guard for the wedge: the applicant's overwrite is
+        already gone, so the row must still be stamped or they come back to a
+        channel they can no longer see."""
+        guild, channel, _, _ = _archive_guild()
+        channel.edit.side_effect = discord.Forbidden(MagicMock(), "nope")
+        with patch.object(rc, "closed_application_discord_id", return_value=111), \
+             patch.object(rc, "get_open_channel_id", return_value=222), \
+             patch.object(rc, "mark_archived") as marked:
+            await rc.archive_recruitment_channel(guild, 1, _channels_settings())
+        marked.assert_called_once_with(222)
