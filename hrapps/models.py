@@ -17,6 +17,12 @@ class HRAppPerms(models.Model):
         )
 
 
+class RecruitmentMode(models.TextChoices):
+    OFF = "off", "Disabled"
+    THREADS = "threads", "Public threads"
+    CHANNELS = "channels", "Private channels"
+
+
 class HRAppDiscordSettings(SingletonModel):
     # Welcome message settings
     enable_welcome_messages = models.BooleanField(default=False)
@@ -24,9 +30,13 @@ class HRAppDiscordSettings(SingletonModel):
     welcome_message = models.TextField(null=True, blank=True)
     ignored_states = models.ManyToManyField(allianceauth.authentication.models.State, blank=True)
 
-    # Recruitment thread settings
-    use_recruitment_threads = models.BooleanField(default=False)
+    # Recruitment settings
+    recruitment_mode = models.CharField(
+        max_length=8, choices=RecruitmentMode.choices, default=RecruitmentMode.OFF
+    )
     recruitment_thread_channel = models.BigIntegerField(null=True, blank=True)
+    recruitment_category = models.BigIntegerField(null=True, blank=True)
+    recruitment_archive_category = models.BigIntegerField(null=True, blank=True)
     recruiter_role = models.BigIntegerField(null=True, blank=True)
     recruit_role = models.BigIntegerField(null=True, blank=True)
 
@@ -40,12 +50,46 @@ class HRAppDiscordSettings(SingletonModel):
 
         constraints = [
             models.CheckConstraint(
-                check=Q(use_recruitment_threads=False) | Q(recruitment_thread_channel__isnull=False),
-                name="recruitment_thread_channel_required_if_threads_enabled"),
+                condition=~Q(recruitment_mode="threads") | Q(recruitment_thread_channel__isnull=False),
+                name="thread_channel_required_in_threads_mode"),
+            models.CheckConstraint(
+                condition=~Q(recruitment_mode="channels") | (
+                    Q(recruitment_category__isnull=False)
+                    & Q(recruitment_archive_category__isnull=False)
+                    & Q(recruiter_role__isnull=False)
+                ),
+                name="categories_and_role_required_in_channels_mode"),
             models.CheckConstraint(
                 check=Q(enable_welcome_messages=False) | Q(welcome_channel__isnull=False),
                 name="welcome_channel_required_if_welcome_messages_enabled")
         ]
+
+
+class RecruitmentChannel(models.Model):
+    """One row per private recruitment channel the bot has created.
+
+    Replaces matching a thread by substring of the member's display name, which
+    broke on renames and matched the wrong thread for members whose names were
+    substrings of each other.
+    """
+    discord_user_id = models.BigIntegerField(db_index=True)
+    channel_id = models.BigIntegerField(unique=True)
+    created = models.DateTimeField(auto_now_add=True)
+    archived = models.DateTimeField(null=True, blank=True)
+
+    # Derived in save(), never set by callers: discord_user_id while the channel
+    # is open, NULL once archived. This is how "one open channel per user" is
+    # enforced on MySQL, which has no partial indexes -- a conditional
+    # UniqueConstraint is silently skipped at migrate time there. MySQL treats
+    # NULLs in a unique index as distinct, so archived rows never collide.
+    open_for_user = models.BigIntegerField(null=True, blank=True, unique=True)
+
+    def save(self, *args, **kwargs):
+        self.open_for_user = None if self.archived else self.discord_user_id
+        super().save(*args, **kwargs)
+
+    class Meta:
+        default_permissions = (())
 
 
 
