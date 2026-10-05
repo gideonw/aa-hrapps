@@ -1,13 +1,16 @@
+from html.parser import HTMLParser
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.contrib.messages import get_messages
-from django.test import TestCase
+from django.conf import settings
+from django.test import TestCase, override_settings
 from django.urls import reverse
 
+from allianceauth.eveonline.models import EveCorporationInfo
 from allianceauth.tests.auth_utils import AuthUtils
 
-from hrapps.models import HRAppDiscordSettings, RecruitmentMode
+from hrapps.models import Form, FormResponse, HRAppDiscordSettings, RecruitmentMode
 
 
 class RecruitmentSettingsViewTests(TestCase):
@@ -163,3 +166,93 @@ class WelcomeSettingsViewTests(TestCase):
         saved = HRAppDiscordSettings.get_solo()
         self.assertEqual(saved.welcome_channel, 12345)
         self.assertEqual(saved.welcome_message, "welcome {user_mention}")
+
+
+class _TableRows(HTMLParser):
+    """Collects the cell count of every <tr> inside one table's <tbody>.
+
+    Counts explicit tags only. A browser opens an implied <tr> for a stray
+    <td>, which is exactly how the missing rows went unnoticed: every
+    application rendered, just all in one row."""
+
+    def __init__(self, table_id):
+        super().__init__()
+        self.table_id = table_id
+        self.in_table = self.in_body = False
+        self.rows = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table" and dict(attrs).get("id") == self.table_id:
+            self.in_table = True
+        elif self.in_table and tag == "tbody":
+            self.in_body = True
+        elif self.in_body and tag == "tr":
+            self.rows.append(0)
+        elif self.in_body and tag == "td":
+            if not self.rows:
+                self.rows.append(0)
+            self.rows[-1] += 1
+
+    def handle_endtag(self, tag):
+        if tag == "tbody":
+            self.in_body = False
+        elif tag == "table":
+            self.in_table = False
+
+
+# The page renders the full AllianceAuth base template, whose {% static %}
+# tags need a manifest that only collectstatic builds. Plain storage resolves
+# them without one.
+@override_settings(
+    STORAGES={
+        **settings.STORAGES,
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"
+        },
+    }
+)
+class ActiveApplicationsTableTests(TestCase):
+    """Each active application must be its own row. DataTables rejects the
+    table outright ("Incorrect column count") when the cells of every
+    application share one row."""
+
+    def setUp(self):
+        self.user = User.objects.create_superuser(
+            "tableadmin", "tableadmin@example.com", "password"
+        )
+        AuthUtils.add_main_character(
+            self.user,
+            "Table Admin",
+            "3",
+            corp_id=1,
+            corp_name="Test Corp",
+            corp_ticker="TEST",
+        )
+        self.user.refresh_from_db()
+        self.client.force_login(self.user)
+
+        corp = EveCorporationInfo.objects.create(
+            corporation_id=1,
+            corporation_name="Test Corp",
+            corporation_ticker="TEST",
+            member_count=1,
+        )
+        form = Form.objects.create(corporation=corp, name="Apply", fields=[])
+        # FormResponse's post_save signals read the applicant's main character
+        # and publish the new application to Redis.
+        for character_id in ("10", "11"):
+            applicant = AuthUtils.create_user(f"applicant{character_id}")
+            AuthUtils.add_main_character(
+                applicant, f"Applicant {character_id}", character_id, corp_id=1
+            )
+            applicant.refresh_from_db()
+            with patch("hrapps.signals.get_redis_client"):
+                FormResponse.objects.create(user=applicant, form=form, response={})
+
+    def test_each_application_is_its_own_row(self):
+        with patch("hrapps.signals.get_redis_client"):
+            response = self.client.get(reverse("hradmin:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        parser = _TableRows("applications-table")
+        parser.feed(response.content.decode())
+        self.assertEqual(parser.rows, [6, 6])
