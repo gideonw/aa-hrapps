@@ -10,7 +10,7 @@ from aadiscordbot.utils.auth import get_auth_user
 from allianceauth.services.hooks import get_extension_logger
 from aadiscordbot.app_settings import get_all_servers, get_site_url
 from aadiscordbot.cogs.utils.exceptions import NotAuthenticated
-from asgiref.sync import sync_to_async
+from hrapps.async_db import db_sync_to_async
 from discord.ext import commands
 from hrapps.models import HRAppDiscordSettings, FormResponse, ResponseComment, RecruitmentMode
 from hrapps.recruitment_channels import (
@@ -165,7 +165,7 @@ class RecruitButtonView(discord.ui.View):
         if interaction.user != self.member:
             await interaction.response.send_message("You can not make this decision for others.", ephemeral=True)
             return
-        settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+        settings = await db_sync_to_async(HRAppDiscordSettings.get_solo)()
 
         # Mode first, role second. Granting recruit_role and then reporting
         # "your channel could not be created" for a mode that never creates one
@@ -323,7 +323,7 @@ class HRApps(commands.Cog):
 
     async def send_new_app_notification(self, app_pk):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
-        embed = await sync_to_async(self._new_app_embed)(app_pk)
+        embed = await db_sync_to_async(self._new_app_embed)(app_pk)
         await channel.send(embed=embed)
 
     def _new_app_embed(self, app_pk):
@@ -348,7 +348,7 @@ class HRApps(commands.Cog):
         return embed
     async def send_new_comment_notification(self, comment_pk):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
-        embed = await sync_to_async(self._new_comment_embed)(comment_pk)
+        embed = await db_sync_to_async(self._new_comment_embed)(comment_pk)
         await channel.send(embed=embed)
 
     def _new_comment_embed(self, comment_pk):
@@ -376,7 +376,7 @@ class HRApps(commands.Cog):
         return embed
     async def send_claim_notification(self, app_pk, recruiter=True):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
-        embed = await sync_to_async(self._claim_embed)(app_pk, recruiter)
+        embed = await db_sync_to_async(self._claim_embed)(app_pk, recruiter)
         await channel.send(embed=embed)
 
     def _claim_embed(self, app_pk, recruiter=True):
@@ -414,7 +414,7 @@ class HRApps(commands.Cog):
         return embed
     async def send_status_notification(self, app_pk, old_status):
         channel = self.bot.get_channel(self.settings.application_notification_channel)
-        embed = await sync_to_async(self._status_embed)(app_pk, old_status)
+        embed = await db_sync_to_async(self._status_embed)(app_pk, old_status)
         await channel.send(embed=embed)
 
     def _status_embed(self, app_pk, old_status):
@@ -458,13 +458,13 @@ class HRApps(commands.Cog):
 
         return embed
     async def update_settings(self):
-        self.settings = await sync_to_async(HRAppDiscordSettings.get_solo)()
+        self.settings = await db_sync_to_async(HRAppDiscordSettings.get_solo)()
         await self._reconcile_subscriptions()
 
     def _is_ignored_state(self, discord_user, guild):
         """Resolve the auth user and test their state against ignored_states.
 
-        Sync on purpose, and called through sync_to_async: get_auth_user queries,
+        Sync on purpose, and called through db_sync_to_async: get_auth_user queries,
         and `user.profile.state` plus `ignored_states.all()` are two more queries.
         Raises NotAuthenticated when the Discord user has no linked auth account,
         which both callers already handle.
@@ -482,7 +482,7 @@ class HRApps(commands.Cog):
             return
         # Check if the user is part of an ignored state, if so we can return, no need to welcome.
         try:
-            if await sync_to_async(self._is_ignored_state)(member._user, member.guild):
+            if await db_sync_to_async(self._is_ignored_state)(member._user, member.guild):
                 logger.debug(f"User is in ignored state, no need to welcome.")
                 return
         except NotAuthenticated:
@@ -533,7 +533,7 @@ class HRApps(commands.Cog):
     @commands.slash_command(name="recruit_me", description="Begin the recruitment process.", guild_ids=get_all_servers())
     async def recruit_me(self, ctx):
         try:
-            if await sync_to_async(self._is_ignored_state)(ctx.author, ctx.guild):
+            if await db_sync_to_async(self._is_ignored_state)(ctx.author, ctx.guild):
                 return await ctx.respond("You are not eligible for recruitment.", ephemeral=True)
         except NotAuthenticated:
             pass

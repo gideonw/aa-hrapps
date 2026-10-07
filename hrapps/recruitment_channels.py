@@ -6,12 +6,12 @@ access and mode dispatch at once. The cog keeps only dispatch.
 
 The sync/async split follows the convention the async-ORM patch established:
 every function that touches the database is sync and is called through
-sync_to_async, because each attribute hop on a Django model can be its own
+db_sync_to_async, because each attribute hop on a Django model can be its own
 query and none of them may run on the gateway's event loop.
 """
 
 import discord
-from asgiref.sync import sync_to_async
+from hrapps.async_db import db_sync_to_async
 from django.utils import timezone
 
 from allianceauth.services.hooks import get_extension_logger
@@ -23,7 +23,7 @@ from hrapps.models import FormResponse, RecruitmentChannel
 logger = get_extension_logger(__name__)
 
 
-# --- ORM helpers. Sync on purpose; always called through sync_to_async. ---
+# --- ORM helpers. Sync on purpose; always called through db_sync_to_async. ---
 
 def get_open_channel_id(discord_user_id):
     """Channel ID of this user's open recruitment channel, or None."""
@@ -79,7 +79,7 @@ async def ensure_recruitment_channel(guild, member, settings):
     here -- it propagates so the caller sees it rather than silently losing
     the channel.
     """
-    channel_id = await sync_to_async(get_open_channel_id)(member.id)
+    channel_id = await db_sync_to_async(get_open_channel_id)(member.id)
     if channel_id is not None:
         channel = guild.get_channel(channel_id)
         if channel is not None:
@@ -94,7 +94,7 @@ async def ensure_recruitment_channel(guild, member, settings):
             f"Recruitment channel {channel_id} for {member.name} ({member.id}) is "
             f"gone; retiring the stale registry row."
         )
-        await sync_to_async(mark_archived)(channel_id)
+        await db_sync_to_async(mark_archived)(channel_id)
 
     return await _create_recruitment_channel(guild, member, settings)
 
@@ -153,7 +153,7 @@ async def _create_recruitment_channel(guild, member, settings):
         return None
 
     try:
-        await sync_to_async(record_channel)(member.id, channel.id)
+        await db_sync_to_async(record_channel)(member.id, channel.id)
     except Exception:
         # An unrecorded channel is invisible to every later lookup: it would leak
         # and the member would be handed a second one next time. Deleting it is
@@ -190,11 +190,11 @@ async def archive_recruitment_channel(bot, app_pk, settings):
     means nothing ever retries. Resolving once also drops three duplicated
     queries per guild per status change.
     """
-    discord_user_id = await sync_to_async(closed_application_discord_id)(app_pk)
+    discord_user_id = await db_sync_to_async(closed_application_discord_id)(app_pk)
     if discord_user_id is None:
         return
 
-    channel_id = await sync_to_async(get_open_channel_id)(discord_user_id)
+    channel_id = await db_sync_to_async(get_open_channel_id)(discord_user_id)
     if channel_id is None:
         # They never ran /recruit_me, or it was archived already.
         return
@@ -206,7 +206,7 @@ async def archive_recruitment_channel(bot, app_pk, settings):
     if channel is None:
         # Deleted by hand. Nothing to move, but retire the row so the member is
         # not blocked if they ever apply again.
-        await sync_to_async(mark_archived)(channel_id)
+        await db_sync_to_async(mark_archived)(channel_id)
         return
 
     guild = channel.guild
@@ -309,5 +309,5 @@ async def archive_recruitment_channel(bot, app_pk, settings):
             f"most 50 channels -- check whether the archive is full. File it by hand."
         )
 
-    await sync_to_async(mark_archived)(channel_id)
+    await db_sync_to_async(mark_archived)(channel_id)
     await channel.send("This application is closed. This channel has been archived.")
